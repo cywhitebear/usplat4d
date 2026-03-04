@@ -186,7 +186,7 @@ def compute_uncertainty_all_frames(
     T = model.num_frames
     u_all = torch.full((G, T), fill_value=phi, device=device)
 
-    img_wh = train_dataset.img_wh  # (W, H) — check dataset attribute name
+    img_wh = train_dataset.get_img_wh()  # (W, H)
 
     for t in range(T):
         # Get Gaussian positions at frame t

@@ -23,6 +23,7 @@ import torch
 import torch.nn.functional as F
 from loguru import logger as guru
 from torch import Tensor
+from tqdm import tqdm
 
 # SoM imports
 from flow3d.scene_model import SceneModel
@@ -103,7 +104,7 @@ class USplat4DTrainer:
         #  Step 1: pre-compute per-Gaussian uncertainties (Section 4.1)       #
         # ------------------------------------------------------------------ #
         guru.info("USplat4D: computing per-Gaussian uncertainties …")
-        self.u_scalar, self.radii_all = compute_uncertainty_all_frames(
+        self.u_scalar = compute_uncertainty_all_frames(
             model=self.model,
             train_dataset=train_dataset,
             device=self.device,
@@ -155,6 +156,10 @@ class USplat4DTrainer:
         self.R_wc_all: Tensor = w2cs[:, :3, :3].transpose(-1, -2)  # (T, 3, 3)
 
         guru.info("USplat4D: initialization complete. Ready to train.")
+
+        # Save a direct reference to SoM's original compute_losses so that
+        # compute_losses_with_graph can call it without hitting the patch.
+        self._som_compute_losses = som_trainer.compute_losses
 
     # ----------------------------------------------------------------------- #
     #  Core loss injection                                                      #
@@ -270,9 +275,10 @@ class USplat4DTrainer:
 
     def compute_losses_with_graph(self, batch):
         """compute_losses that appends USplat4D graph losses to SoM losses."""
-        # Run base SoM losses
+        # Call the saved original — not self.som_trainer.compute_losses, which
+        # has been replaced with this function (would cause infinite recursion).
         loss, stats, num_rays_per_step, num_rays_per_sec = \
-            self.som_trainer.compute_losses(batch)
+            self._som_compute_losses(batch)
 
         # Inject graph losses using the same frame indices
         ts = batch["ts"].to(self.device)  # (B,)
@@ -313,8 +319,14 @@ class USplat4DTrainer:
         guru.info(f"USplat4D: starting fine-tuning for {n_epochs} extra epochs "
                   f"(from epoch {start_epoch})")
 
+        epoch_bar = tqdm(
+            range(start_epoch, start_epoch + n_epochs),
+            desc="USplat4D fine-tuning",
+            unit="epoch",
+            dynamic_ncols=True,
+        )
         try:
-            for epoch in range(start_epoch, start_epoch + n_epochs):
+            for epoch in epoch_bar:
                 self.som_trainer.set_epoch(epoch)
 
                 # Disable density control in first + last 20% of extra epochs
@@ -326,12 +338,25 @@ class USplat4DTrainer:
                     orig_ctrl = self.som_trainer.optim_cfg.control_every
                     self.som_trainer.optim_cfg.control_every = int(1e9)
 
-                for batch in train_loader:
+                batch_bar = tqdm(
+                    train_loader,
+                    desc=f"Epoch {epoch}",
+                    unit="batch",
+                    leave=False,
+                    dynamic_ncols=True,
+                )
+                for batch in batch_bar:
                     batch = {
-                        k: v.to(self.device) if isinstance(v, Tensor) else v
+                        k: [t.to(self.device) for t in v]
+                        if isinstance(v, list) and len(v) > 0 and isinstance(v[0], Tensor)
+                        else v.to(self.device) if isinstance(v, Tensor)
+                        else v
                         for k, v in batch.items()
                     }
                     loss_val = self.som_trainer.train_step(batch)
+                    batch_bar.set_postfix(loss=f"{loss_val:.4f}")
+
+                epoch_bar.set_postfix(loss=f"{loss_val:.4f}", dc_off=disable_dc)
 
                 if disable_dc:
                     self.som_trainer.optim_cfg.control_every = orig_ctrl

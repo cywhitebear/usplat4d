@@ -231,8 +231,8 @@ def build_graph(
     # nonkey_nbrs: (N_n, K+1) indices into key_idx (local)
     nbr_key_global = key_idx[nonkey_nbrs.reshape(-1)].reshape(N_n, k_eff + 1)  # (N_n, K+1) global idx
     nbr_t = nk_best_t.unsqueeze(-1).expand(-1, k_eff + 1)                      # (N_n, K+1)
-    nbr_pos = means_t[nbr_key_global, nbr_t.reshape(-1)].reshape(N_n, k_eff + 1, 3)  # (N_n, K+1, 3)
-    nbr_u   = u_scalar[nbr_key_global, nbr_t.reshape(-1)].reshape(N_n, k_eff + 1)    # (N_n, K+1)
+    nbr_pos = means_t[nbr_key_global.reshape(-1), nbr_t.reshape(-1)].reshape(N_n, k_eff + 1, 3)  # (N_n, K+1, 3)
+    nbr_u   = u_scalar[nbr_key_global.reshape(-1), nbr_t.reshape(-1)].reshape(N_n, k_eff + 1)    # (N_n, K+1)
 
     diff_nk = nk_pos_best.unsqueeze(1) - nbr_pos           # (N_n, K+1, 3)
     dist_sq_nk = (diff_nk ** 2).sum(dim=-1)                # (N_n, K+1)

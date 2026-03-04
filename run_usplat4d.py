@@ -26,7 +26,7 @@ Checkpoints are written to <out-dir>/, with the final model saved as
 import os
 import sys
 import os.path as osp
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Annotated, Optional, Tuple
 
 import torch
@@ -73,13 +73,14 @@ class USplat4DRunConfig:
         | Annotated[DavisDataConfig, tyro.conf.subcommand(name="davis")]
         | Annotated[CustomDataConfig, tyro.conf.subcommand(name="custom")]
         | Annotated[NvidiaDataConfig, tyro.conf.subcommand(name="nvidia")]
-    ) = field(default_factory=NvidiaDataConfig)
+    )
     """Dataset config — must match the one used for SoM training."""
 
     # SoM model / optimizer configs (needed to reconstruct Trainer)
-    lr: SceneLRConfig = field(default_factory=SceneLRConfig)
-    loss: LossesConfig = field(default_factory=LossesConfig)
-    optim: OptimizerConfig = field(default_factory=OptimizerConfig)
+    # All sub-fields have defaults, so tyro resolves them without CLI input.
+    lr: SceneLRConfig
+    loss: LossesConfig
+    optim: OptimizerConfig
 
     # USplat4D hyperparameters (all paper defaults)
     key_ratio: float = 0.02
