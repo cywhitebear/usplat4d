@@ -110,7 +110,7 @@ python run_training.py \
 
 ---
 
-## Current Status (2026-03-04)
+## Current Status (2026-03-18)
 
 ### ✅ Completed
 - [x] Project directory created: `/home/ee904/Yun/USplat4D/`
@@ -119,6 +119,10 @@ python run_training.py \
 - [x] USplat4D GitHub repo checked — code not yet released ("Coming Soon")
 - [x] Implementation plan approved by user
 - [x] All 6 modules implemented and syntax/import-checked
+- [x] USplat4D training run completed on `iphone/backpack`
+- [x] Rendering pipeline for USplat4D outputs validated (viewer works after prep)
+- [x] Added helper script: `prepare_for_rendering.sh`
+- [x] Baseline-ablation run setup validated (`--lambda-key 0 --lambda-non-key 0` CLI usage fixed)
 
 ### Module Inventory
 
@@ -135,8 +139,9 @@ python run_training.py \
 ### Bugs Found and Fixed
 1. **`losses.py` / `rigidity_loss` + `rotation_loss`**: weight tensor ndim mismatch — used `unsqueeze(1).unsqueeze(-1)` where only `unsqueeze(1)` was needed to broadcast against a 3D `diff_sq` tensor.
 2. **`losses.py` / `rotation_loss`**: neighbor quaternions were indexed from the full `quats_t` (B frames) instead of the `q_curr` slice (B−Δ frames), causing a shape mismatch at runtime.
+3. **`trainer.py` / training loop**: batch device transfer only handled plain `Tensor` values. SoM's `train_collate_fn` keeps `target_ts`, `target_w2cs`, etc. as **lists of tensors**; those stayed on CPU, causing a device mismatch in the `einsum` inside `scene_model.render`. Fixed to also iterate over list-of-tensor batch fields.
 
-Both bugs were caught by smoke tests with random tensors (verified forward pass + backward pass).
+Both bugs 1–2 were caught by smoke tests with random tensors (verified forward pass + backward pass).
 
 ### Smoke Test Results (as of 2026-03-04)
 ```
@@ -147,27 +152,66 @@ All losses OK
 
 ---
 
-## Next Steps
+## Known Issues & Workarounds
 
-### 🔲 End-to-end Integration Test (actual data)
+### USplat4D quality regression on `iphone/backpack`
+**Observation:** USplat4D output is renderable, but quality is worse than SoM baseline. The backpack deformation during rotation is not improved, and overall scene quality degrades.
+
+**Interpretation:** code path is functioning end-to-end (training + checkpoint + rendering), but optimization behavior is likely incorrect (loss design/weighting, graph construction, or uncertainty/anchor selection), not a crash/integration issue.
+
+**Current debug direction:**
+- Run A/B ablation with graph losses disabled (`--lambda-key 0 --lambda-non-key 0`) to isolate whether regression comes from graph losses.
+- Compare SoM baseline vs USplat4D outputs under the same rendering setup.
+- Inspect graph statistics and loss scale balance if regression persists.
+
+### SoM iphone training — OOM kill during `save_train_videos`
+**Root cause:** `save_train_videos` renders all training frames and stacks them fully in RAM before writing to disk. For long iphone sequences (722 frames) this spikes memory by ~15–20 GB, exhausting RAM + swap and triggering the OOM killer.
+
+**Immediate fix:** disable in-training video saving by raising `--save-videos-every` to equal `--num-epochs`:
 ```bash
-conda activate som
-cd /home/ee904/Yun/USplat4D
-python run_usplat4d.py \
-    --som-dir /media/ee904/DATA1/Yun/Outputs/shape-of-motion/nvidia/Skating \
-    --out-dir /media/ee904/DATA1/Yun/Outputs/usplat4d/nvidia/Skating \
-    data:nvidia \
-    --data.data-dir /media/ee904/DATA1/Yun/Datasets/shape-of-motion/nvidia/Skating
+python run_training.py \
+  --work-dir /media/ee904/DATA1/Yun/Outputs/shape-of-motion/iphone/spin \
+  --save-videos-every 500 \
+  data:iphone \
+  --data.data-dir /media/ee904/DATA1/Yun/Datasets/shape-of-motion/iphone/spin
 ```
 
-Test milestones to verify:
-1. SoM checkpoint loads without error
-2. `compute_uncertainty_all_frames` runs on all T frames
-3. `build_graph` produces reasonable N_k / N_n ratio (~2% key)
-4. `compute_usplat4d_losses` produces finite scalars
-5. `.backward()` completes without NaN
-6. A few fine-tuning epochs run and checkpoints appear in `{work_dir}/usplat4d/`
+### Visualizing USplat4D result with `run_rendering.py`
+`run_rendering.py` expects `{work_dir}/checkpoints/last.ckpt` and `{work_dir}/cfg.yaml` (with `use_2dgs` key from SoM). USplat4D writes its checkpoint to `{out_dir}/usplat4d/final.ckpt` and its own `cfg.yaml` (different schema). Prep steps before running the viewer:
+
+```bash
+OUT=/media/ee904/DATA1/Yun/Outputs/usplat4d/iphone/backpack  # example
+SOM=/media/ee904/DATA1/Yun/Outputs/shape-of-motion/iphone/backpack
+
+mkdir -p $OUT/checkpoints
+ln -sf $OUT/usplat4d/final.ckpt $OUT/checkpoints/last.ckpt
+cp $SOM/cfg.yaml $OUT/cfg.yaml   # use SoM's cfg.yaml for the use_2dgs flag
+
+cd /home/ee904/Yun/shape-of-motion
+python run_rendering.py --work-dir $OUT --port 8890
+# then open http://localhost:8890
+```
+
+### Rendering prep helper script
+To avoid repeating manual prep commands for each new USplat4D output folder:
+
+```bash
+cd /home/ee904/Yun/USplat4D
+./prepare_for_rendering.sh <usplat4d_out_dir> <som_dir>
+```
+
+Example:
+
+```bash
+./prepare_for_rendering.sh \
+  /media/ee904/DATA1/Yun/Outputs/usplat4d/iphone/backpack_graph_check \
+  /media/ee904/DATA1/Yun/Outputs/shape-of-motion/iphone/backpack
+```
+
+---
+
+## Next Steps
 
 ### 🔲 Quantitative Evaluation
 - Render with final USplat4D checkpoint using SoM's existing `Validator`
-- Compare PSNR / SSIM / LPIPS against SoM baseline on nvidia/Skating
+- Compare PSNR / SSIM / LPIPS against SoM baseline on iphone/backpack
