@@ -140,8 +140,10 @@ python run_training.py \
 1. **`losses.py` / `rigidity_loss` + `rotation_loss`**: weight tensor ndim mismatch — used `unsqueeze(1).unsqueeze(-1)` where only `unsqueeze(1)` was needed to broadcast against a 3D `diff_sq` tensor.
 2. **`losses.py` / `rotation_loss`**: neighbor quaternions were indexed from the full `quats_t` (B frames) instead of the `q_curr` slice (B−Δ frames), causing a shape mismatch at runtime.
 3. **`trainer.py` / training loop**: batch device transfer only handled plain `Tensor` values. SoM's `train_collate_fn` keeps `target_ts`, `target_w2cs`, etc. as **lists of tensors**; those stayed on CPU, causing a device mismatch in the `einsum` inside `scene_model.render`. Fixed to also iterate over list-of-tensor batch fields.
+4. **`losses.py` / neighbor index semantics** (2026-03-18): Non-key neighbors are KEY nodes, but old code used key-space indices to index non-key tensors. **FIXED**: Added optional neighbor array parameters to `isometry_loss()`, `rigidity_loss()`, `rotation_loss()` and updated call chain to pass correct key node arrays.
+5. **`run_usplat4d.py` / checkpoint corruption** (2026-03-18): Line 157 set `work_dir=cfg.som_dir`, causing USplat4D training to overwrite the SoM checkpoint. **FIXED**: Changed to `work_dir=cfg.out_dir` to preserve SoM checkpoint independence.
 
-Both bugs 1–2 were caught by smoke tests with random tensors (verified forward pass + backward pass).
+All bugs 1–4 were caught by smoke tests or static code analysis; bug 5 discovered during multi-run testing.
 
 ### Smoke Test Results (as of 2026-03-04)
 ```
@@ -154,15 +156,56 @@ All losses OK
 
 ## Known Issues & Workarounds
 
-### USplat4D quality regression on `iphone/backpack`
-**Observation:** USplat4D output is renderable, but quality is worse than SoM baseline. The backpack deformation during rotation is not improved, and overall scene quality degrades.
+### ⚠️ FOUND: USplat4D quality regression on `iphone/backpack` — root cause identified
 
-**Interpretation:** code path is functioning end-to-end (training + checkpoint + rendering), but optimization behavior is likely incorrect (loss design/weighting, graph construction, or uncertainty/anchor selection), not a crash/integration issue.
+**Initial Observation:** USplat4D output is renderable but degrades quality; deformation during backpack rotation is not improved.
 
-**Current debug direction:**
-- Run A/B ablation with graph losses disabled (`--lambda-key 0 --lambda-non-key 0`) to isolate whether regression comes from graph losses.
-- Compare SoM baseline vs USplat4D outputs under the same rendering setup.
-- Inspect graph statistics and loss scale balance if regression persists.
+**Diagnosis (2026-03-18):**
+Added diagnostic logging to `trainer.py` to inspect uncertainty stats and loss magnitudes. **Result: CRITICAL BUG FOUND.**
+
+**PRIMARY ROOT CAUSE: Uncertainty computation is too strict**
+
+Diagnostic output showed:
+```
+u_all: [1.51e-05, 1.00e+06, 1.00e+06] | u_key_nodes: [1.51e-05, 1.00e+06, 1.00e+06] | key_ratio_target=0.02
+```
+
+- **Median uncertainty = 1e+06** (the ceiling value `phi` for "diverged" Gaussians)
+- **Max uncertainty = 1e+06** (almost ALL Gaussians classified as diverged/unconverged)
+- **Key nodes have identical distribution to all Gaussians** (no selection benefit, no reliable anchors)
+
+**Why this breaks USplat4D:**
+- The convergence check `|C_gt - C_pred|_1 < eta_c` (default `eta_c=0.5`) is too strict
+- Almost every Gaussian is flagged as "not converged" → assigned `u_i = phi = 1e6`
+- When all uncertainties = 1e6, the Mahalanobis graph is effectively uniform (no meaningful constraints)
+- Graph losses constrain nothing; quality degradation is then unexplained
+
+**The fix:**
+Increase `eta_c` significantly. Paper used 0.5 on different datasets; for iphone/backpack try `eta_c=5.0` or higher:
+
+```bash
+python run_usplat4d.py \
+  --som-dir /media/ee904/DATA1/Yun/Outputs/shape-of-motion/iphone/backpack \
+  --out-dir /media/ee904/DATA1/Yun/Outputs/usplat4d/iphone/backpack_fixed \
+  --eta-c 5.0 \
+  --lambda-key 1 --lambda-non-key 1 \
+  --extra-epochs 400 \
+  data:iphone \
+  --data.data-dir /media/ee904/DATA1/Yun/Datasets/shape-of-motion/iphone/backpack
+```
+
+**Workaround (if eta-c still wrong):**
+Manually adjust `eta_c` in a loop or use binary search to find a value where:
+- Median `u_all` < 1e6  (most Gaussians are "converged")
+- Median `u_key_nodes` < median `u_all`  (key selection working)
+
+**Diagnostic code added:** trainer.py now logs at init:
+```
+USplat4D Diagnostics: u_all: [min, median, max] | u_key_nodes: [min, median, max]
+```
+Use this to verify fix works.
+
+
 
 ### SoM iphone training — OOM kill during `save_train_videos`
 **Root cause:** `save_train_videos` renders all training frames and stacks them fully in RAM before writing to disk. For long iphone sequences (722 frames) this spikes memory by ~15–20 GB, exhausting RAM + swap and triggering the OOM killer.
@@ -176,42 +219,89 @@ python run_training.py \
   --data.data-dir /media/ee904/DATA1/Yun/Datasets/shape-of-motion/iphone/spin
 ```
 
-### Visualizing USplat4D result with `run_rendering.py`
-`run_rendering.py` expects `{work_dir}/checkpoints/last.ckpt` and `{work_dir}/cfg.yaml` (with `use_2dgs` key from SoM). USplat4D writes its checkpoint to `{out_dir}/usplat4d/final.ckpt` and its own `cfg.yaml` (different schema). Prep steps before running the viewer:
+### Rendering USplat4D results
+Simple one-command rendering (no manual prep needed):
 
 ```bash
-OUT=/media/ee904/DATA1/Yun/Outputs/usplat4d/iphone/backpack  # example
-SOM=/media/ee904/DATA1/Yun/Outputs/shape-of-motion/iphone/backpack
-
-mkdir -p $OUT/checkpoints
-ln -sf $OUT/usplat4d/final.ckpt $OUT/checkpoints/last.ckpt
-cp $SOM/cfg.yaml $OUT/cfg.yaml   # use SoM's cfg.yaml for the use_2dgs flag
-
-cd /home/ee904/Yun/shape-of-motion
-python run_rendering.py --work-dir $OUT --port 8890
-# then open http://localhost:8890
+python render_usplat4d.py \
+  --work-dir /media/ee904/DATA1/Yun/Outputs/usplat4d/iphone/backpack_debug_eta \
+  --port 8890
 ```
 
-### Rendering prep helper script
-To avoid repeating manual prep commands for each new USplat4D output folder:
+Then open `http://localhost:8890` in your browser.
 
+**`render_usplat4d.py` automatically:**
+- Finds USplat4D's `final.ckpt`
+- Reads `cfg.yaml` to extract SoM directory
+- Sets up symlinks and config files
+- Launches the SoM renderer
+
+No more manual prep needed! (Legacy prep steps removed.)
+
+---
+
+## Debug Tools & Process (Added 2026-03-18)
+
+### Diagnostic Logging in `trainer.py`
+- Added `_first_batch_logged` flag to log statistics on first training batch
+- On `global_step==0`, prints:
+  - `l_key` and `l_non_key` loss values
+  - `pos_dev_key` / `pos_dev_nk`: mean position deviation from pretrained
+  - Uncertainty shape and range for key/non-key nodes
+- Helps quickly identify:
+  - If losses are non-zero (constraints are active)
+  - If deviations are non-trivial (model has room to improve)
+  - If uncertainty distribution is sane
+
+### Quick Debug Commands
+**Test with relaxed convergence threshold:**
 ```bash
-cd /home/ee904/Yun/USplat4D
-./prepare_for_rendering.sh <usplat4d_out_dir> <som_dir>
+python run_usplat4d.py --som-dir ... --out-dir ... --eta-c 5.0 --extra-epochs 5 data:iphone ...
 ```
 
-Example:
-
+**Test ablations:**
 ```bash
-./prepare_for_rendering.sh \
-  /media/ee904/DATA1/Yun/Outputs/usplat4d/iphone/backpack_graph_check \
-  /media/ee904/DATA1/Yun/Outputs/shape-of-motion/iphone/backpack
+# Key loss only
+python run_usplat4d.py ... --lambda-key 1 --lambda-non-key 0 ...
+
+# Non-key loss only
+python run_usplat4d.py ... --lambda-key 0 --lambda-non-key 1 ...
+
+# No graph losses (baseline)
+python run_usplat4d.py ... --lambda-key 0 --lambda-non-key 0 ...
 ```
 
 ---
 
 ## Next Steps
 
-### 🔲 Quantitative Evaluation
-- Render with final USplat4D checkpoint using SoM's existing `Validator`
-- Compare PSNR / SSIM / LPIPS against SoM baseline on iphone/backpack
+### ✅ Completed: Critical bugs fixed (2026-03-18)
+1. **Secondary index bug** ✓ — Key nodes now correctly indexed in motion losses
+2. **Checkpoint corruption bug** ✓ — SoM checkpoint no longer overwritten by USplat4D training
+3. **Rendering prep simplified** ✓ — New `render_usplat4d.py` eliminates manual setup
+
+### 🔲 Immediate Action: Test eta_c fix with corrected motion loss
+1. **Re-train SoM** on iphone/backpack (to reset checkpoint modified by earlier runs)
+2. **Run USplat4D with increased `eta_c`** (5.0 or higher):
+   ```bash
+   python run_usplat4d.py \
+     --som-dir /media/ee904/DATA1/Yun/Outputs/shape-of-motion/iphone/backpack \
+     --out-dir /media/ee904/DATA1/Yun/Outputs/usplat4d/iphone/backpack_eta_5p0_index_fixed \
+     --eta-c 5.0 --lambda-key 1 --lambda-non-key 1 --extra-epochs 400 \
+     data:iphone \
+     --data.data-dir /media/ee904/DATA1/Yun/Datasets/shape-of-motion/iphone/backpack
+   ```
+3. **Verify diagnostics** on first batch show:
+   - Median `u_all` < 1e6  (most Gaussians converged)
+   - Median `u_key_nodes` < median `u_all`  (selection working)
+   - `l_non_key` > 0.01 (motion constraints active)
+4. **Render and compare** quality vs SoM baseline:
+   ```bash
+   python render_usplat4d.py --work-dir /media/ee904/DATA1/Yun/Outputs/usplat4d/iphone/backpack_eta_5p0_index_fixed
+   ```
+
+### 🔲 After eta_c validation
+- If quality improved: test on other datasets (nvidia, davis) for robustness
+- If still degraded: binary search on eta_c in [1.0, 10.0]
+- Quantitative metrics: PSNR/SSIM/LPIPS once quality baseline established
+- Document final hyperparameter recommendation for paper

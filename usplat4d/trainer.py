@@ -97,6 +97,7 @@ class USplat4DTrainer:
         self.cfg = cfg or USplat4DConfig()
         self.device = device or next(self.model.parameters()).device
         self.work_dir = work_dir or som_trainer.work_dir
+        self._first_batch_logged = False  # Flag for per-batch diagnostics
 
         os.makedirs(os.path.join(self.work_dir, "usplat4d"), exist_ok=True)
 
@@ -137,8 +138,17 @@ class USplat4DTrainer:
             knn_k=self.cfg.knn_k,
         )
         guru.info(
-            f"  → {len(self.graph.key_idx)} key nodes, "
+            f"  → {len(self.graph.key_idx)} key nodes ({100*len(self.graph.key_idx)/G_fg:.1f}%), "
             f"{len(self.graph.nonkey_idx)} non-key nodes"
+        )
+        # Diagnostic: key node uncertainty stats
+        u_key_nodes = self.u_scalar[self.graph.key_idx]
+        u_all = self.u_scalar
+        guru.info(
+            f"USplat4D Diagnostics:"
+            f" u_all: [{u_all.min():.2e}, {u_all.median():.2e}, {u_all.max():.2e}] "
+            f"| u_key_nodes: [{u_key_nodes.min():.2e}, {u_key_nodes.median():.2e}, {u_key_nodes.max():.2e}] "
+            f"| key_ratio_target={self.cfg.key_ratio}"
         )
 
         # ------------------------------------------------------------------ #
@@ -165,7 +175,7 @@ class USplat4DTrainer:
     #  Core loss injection                                                      #
     # ----------------------------------------------------------------------- #
 
-    def compute_usplat4d_losses(self, ts: Tensor) -> Tensor:
+    def compute_usplat4d_losses(self, ts: Tensor, log_first_batch: bool = True) -> Tensor:
         """Compute USplat4D graph losses for a set of sampled frame indices.
 
         Args:
@@ -253,6 +263,11 @@ class USplat4DTrainer:
             pos_o_nk=pos_o_nk,
             R_key_t=R_key_t,         # current key node rotations
             t_key_t=t_key_t,         # current key node translations
+            # Motion loss: key node positions, quats, transforms, canonical positions
+            pos_key_t=pos_key_t,
+            quats_key_t=quats_key_t,
+            transforms_key_t=transforms_key,
+            pos_o_key=pos_o_key,
             nonkey_nbrs_local=nonkey_nbrs_local,
             nonkey_nbr_weights=nonkey_nbr_weights,
             nonkey_nbrs_global=nonkey_nbrs_local,  # same (keys indexed 0..N_k-1)
@@ -263,6 +278,21 @@ class USplat4DTrainer:
             lambda_vel=self.cfg.lambda_vel,
             lambda_acc=self.cfg.lambda_acc,
         )
+
+        # Log diagnostics on first batch
+        if not self._first_batch_logged and self.som_trainer.global_step == 0:
+            self._first_batch_logged = True
+            with torch.no_grad():
+                pos_dev_key = (pos_key_t - pos_key_pre).norm(dim=-1).mean()
+                pos_dev_nk = (pos_nk_t - pos_nk_pre).norm(dim=-1).mean()
+                guru.info(
+                    f"USplat4D First Batch Diagnostics:\n"
+                    f"  l_key={l_key.item():.4f}, l_non_key={l_non_key.item():.4f}\n"
+                    f"  pos_dev_key (||p_curr - p_pretrained||): {pos_dev_key:.4f}\n"
+                    f"  pos_dev_nk: {pos_dev_nk:.4f}\n"
+                    f"  u_key shape: {u_key.shape}, range: [{u_key.min():.2e}, {u_key.max():.2e}]\n"
+                    f"  u_nk shape: {u_nk.shape}, range: [{u_nk.min():.2e}, {u_nk.max():.2e}]"
+                )
 
         return self.cfg.lambda_key * l_key + self.cfg.lambda_non_key * l_non_key, {
             "usplat4d/l_key": l_key.item(),

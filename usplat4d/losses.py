@@ -38,21 +38,30 @@ def isometry_loss(
     pos_o:   Tensor,    # (N, 3)      canonical (initial) positions
     nbr_idx: Tensor,    # (N, K)      neighbor indices (0..N-1 within the N Gaussians)
     weights: Tensor,    # (N, K)      edge weights
+    pos_nbr_t: Tensor = None,  # (N_nbr, B, 3) neighbor positions (if different from pos_t)
+    pos_o_nbr: Tensor = None,  # (N_nbr, 3) neighbor canonical positions (if different from pos_o)
 ) -> Tensor:
     """Isometry loss L_iso (Eq. S8): canonical distances should be preserved over time.
 
     L_iso = 1/(K*N) * sum_t sum_i sum_j w_{ij} * (||p^o_j - p^o_i||^2 - ||p_{j,t} - p_{i,t}||^2)
+    
+    If pos_nbr_t/pos_o_nbr provided, use for neighbors (mixed center/neighbor case).
     """
+    if pos_nbr_t is None:
+        pos_nbr_t = pos_t
+    if pos_o_nbr is None:
+        pos_o_nbr = pos_o
+    
     # Canonical pairwise distances squared
     p_i_o = pos_o.unsqueeze(1)                   # (N, 1, 3)
-    p_j_o = pos_o[nbr_idx]                       # (N, K, 3)
+    p_j_o = pos_o_nbr[nbr_idx]                   # (N, K, 3)
     dist_o_sq = ((p_i_o - p_j_o) ** 2).sum(-1)  # (N, K)
 
     # Time-varying pairwise distances squared
-    # pos_t[nbr_idx]: (N, K, B, 3)  (fancy index on first dim)
-    p_j_t = pos_t[nbr_idx].permute(0, 2, 1, 3)  # (N, B, K, 3)
-    p_i_t = pos_t.unsqueeze(2)                   # (N, B, 1, 3)
-    dist_t_sq = ((p_i_t - p_j_t) ** 2).sum(-1)  # (N, B, K)
+    # pos_nbr_t[nbr_idx]: (N, K, B, 3)  (fancy index on first dim)
+    p_j_t = pos_nbr_t[nbr_idx].permute(0, 2, 1, 3)  # (N, B, K, 3)
+    p_i_t = pos_t.unsqueeze(2)                      # (N, B, 1, 3)
+    dist_t_sq = ((p_i_t - p_j_t) ** 2).sum(-1)     # (N, B, K)
 
     # (dist_o^2 - dist_t^2)  shape: need to broadcast dist_o_sq (N, K) → (N, 1, K)
     diff = dist_o_sq.unsqueeze(1) - dist_t_sq             # (N, B, K)
@@ -66,6 +75,8 @@ def rigidity_loss(
     nbr_idx:  Tensor,       # (N, K)
     weights:  Tensor,       # (N, K)
     delta: int = 1,         # frame interval Δ
+    pos_nbr_t: Tensor = None,  # (N_nbr, B, 3) neighbor positions (if different)
+    transforms_nbr_t: Tensor = None,  # (N_nbr, B, 3, 4) neighbor transforms (if different)
 ) -> Tensor:
     """Rigidity loss L_rigid (Eq. S9): neighbors should move rigidly together.
 
@@ -74,16 +85,29 @@ def rigidity_loss(
 
     T_{i,t-Δ} T_{i,t}^{-1} p_{j,t}
         = R_{i,t-Δ} @ (R_{i,t}^T @ (p_{j,t} - t_{i,t})) + t_{i,t-Δ}
+    
+    If pos_nbr_t/transforms_nbr_t provided, use for neighbors (mixed case).
     """
+    if pos_nbr_t is None:
+        pos_nbr_t = pos_t
+    if transforms_nbr_t is None:
+        transforms_nbr_t = transforms_t
+    
     B = pos_t.shape[1]
     if B <= delta:
         return pos_t.new_zeros(())
 
     # Split into (t-Δ) and t parts (along frame batch dimension)
-    pos_prev = pos_t[:, :B - delta]          # (N, B-Δ, 3)
-    T_prev = transforms_t[:, :B - delta]     # (N, B-Δ, 3, 4)
-    T_curr = transforms_t[:, delta:]         # (N, B-Δ, 3, 4)
-    pos_curr = pos_t[:, delta:]              # (N, B-Δ, 3)
+    pos_prev = pos_t[:, :B - delta]               # (N, B-Δ, 3)
+    T_prev = transforms_t[:, :B - delta]          # (N, B-Δ, 3, 4)
+    T_curr = transforms_t[:, delta:]              # (N, B-Δ, 3, 4)
+    pos_curr = pos_t[:, delta:]                   # (N, B-Δ, 3)
+    
+    # Neighbor transforms (for center node i)
+    T_nbr_prev = transforms_nbr_t[:, :B - delta]  # (N_nbr, B-Δ, 3, 4)
+    T_nbr_curr = transforms_nbr_t[:, delta:]      # (N_nbr, B-Δ, 3, 4)
+    pos_nbr_prev = pos_nbr_t[:, :B - delta]       # (N_nbr, B-Δ, 3)
+    pos_nbr_curr = pos_nbr_t[:, delta:]           # (N_nbr, B-Δ, 3)
 
     R_prev = T_prev[..., :3, :3]  # (N, B-Δ, 3, 3)
     t_prev = T_prev[..., :3, 3]   # (N, B-Δ, 3)
@@ -95,10 +119,10 @@ def rigidity_loss(
     # step 2: T_{i,t-Δ} @ result = R_prev @ result + t_prev
 
     # Neighbor positions at frame t (pos_curr) and t-Δ (pos_prev)
-    p_j_curr = pos_curr[nbr_idx]             # (N, K, B-Δ, 3)
-    p_j_curr = p_j_curr.permute(0, 2, 1, 3) # (N, B-Δ, K, 3)
-    p_j_prev = pos_prev[nbr_idx]             # (N, K, B-Δ, 3)
-    p_j_prev = p_j_prev.permute(0, 2, 1, 3) # (N, B-Δ, K, 3)
+    p_j_curr = pos_nbr_curr[nbr_idx]             # (N, K, B-Δ, 3)
+    p_j_curr = p_j_curr.permute(0, 2, 1, 3)     # (N, B-Δ, K, 3)
+    p_j_prev = pos_nbr_prev[nbr_idx]             # (N, K, B-Δ, 3)
+    p_j_prev = p_j_prev.permute(0, 2, 1, 3)     # (N, B-Δ, K, 3)
 
     # Broadcast transforms: (N, B-Δ, 3, 3) → (N, B-Δ, 1, 3, 3) for K neighbors
     R_curr_exp = R_curr.unsqueeze(2)   # (N, B-Δ, 1, 3, 3)
@@ -123,6 +147,7 @@ def rotation_loss(
     nbr_idx: Tensor,    # (N, K)
     weights: Tensor,    # (N, K)
     delta: int = 1,
+    quats_nbr_t: Tensor = None,  # (N_nbr, B, 4) neighbor quaternions (if different)
 ) -> Tensor:
     """Relative rotation loss L_rot (Eq. S10).
 
@@ -130,13 +155,20 @@ def rotation_loss(
             * ||q_{j,t} q_{j,t-Δ}^{-1} - q_{i,t} q_{i,t-Δ}^{-1}||^2
 
     Relative rotation of j (from t-Δ to t) should match that of i.
+    If quats_nbr_t provided, use for neighbors (mixed case).
     """
+    if quats_nbr_t is None:
+        quats_nbr_t = quats_t
+    
     B = quats_t.shape[1]
     if B <= delta:
         return quats_t.new_zeros(())
 
-    q_prev = quats_t[:, :B - delta]   # (N, B-Δ, 4)
-    q_curr = quats_t[:, delta:]       # (N, B-Δ, 4)
+    q_prev = quats_t[:, :B - delta]      # (N, B-Δ, 4)
+    q_curr = quats_t[:, delta:]          # (N, B-Δ, 4)
+    
+    q_nbr_prev = quats_nbr_t[:, :B - delta]  # (N_nbr, B-Δ, 4)
+    q_nbr_curr = quats_nbr_t[:, delta:]      # (N_nbr, B-Δ, 4)
 
     # Quaternion inverse (unit quat): conjugate
     q_prev_inv = torch.cat([q_prev[..., :1], -q_prev[..., 1:]], dim=-1)  # (N, B-Δ, 4)
@@ -156,9 +188,9 @@ def rotation_loss(
     # (row: N, col: B-Δ, 4)
     q_i_rel = quat_mul_batch(q_curr, q_prev_inv)          # (N, B-Δ, 4)
 
-    # Neighbor quats at t and t-Δ  (index q_curr/q_prev, not full quats_t)
-    q_j_curr = q_curr[nbr_idx].permute(0, 2, 1, 3)        # (N, B-Δ, K, 4)
-    q_j_prev = q_prev[nbr_idx].permute(0, 2, 1, 3)        # (N, B-Δ, K, 4)
+    # Neighbor quats at t and t-Δ  (index q_nbr_curr/q_nbr_prev)
+    q_j_curr = q_nbr_curr[nbr_idx].permute(0, 2, 1, 3)    # (N, B-Δ, K, 4)
+    q_j_prev = q_nbr_prev[nbr_idx].permute(0, 2, 1, 3)    # (N, B-Δ, K, 4)
     q_j_prev_inv = torch.cat([q_j_prev[..., :1], -q_j_prev[..., 1:]], dim=-1)
     q_j_rel = quat_mul_batch(q_j_curr, q_j_prev_inv)      # (N, B-Δ, K, 4)
 
@@ -274,26 +306,42 @@ def motion_loss_key(
 
 
 def motion_loss_non_key(
-    pos_t:             Tensor,   # (N_n, B, 3)
-    quats_t:           Tensor,   # (N_n, B, 4)
-    transforms_t:      Tensor,   # (N_n, B, 3, 4)
-    pos_o:             Tensor,   # (N_n, 3) canonical positions of non-key nodes
-    nonkey_nbrs_local: Tensor,   # (N_n, K+1)
+    pos_t:             Tensor,   # (N_n, B, 3)  non-key node positions
+    quats_t:           Tensor,   # (N_n, B, 4)  non-key quaternions
+    transforms_t:      Tensor,   # (N_n, B, 3, 4)  non-key transforms
+    pos_o:             Tensor,   # (N_n, 3) non-key canonical positions
+    nonkey_nbrs_local: Tensor,   # (N_n, K+1)  neighbors (indices into key-space)
     nonkey_nbr_weights: Tensor,  # (N_n, K+1)
+    pos_key_t: Tensor = None,    # (N_k, B, 3)  key node positions
+    quats_key_t: Tensor = None,  # (N_k, B, 4)  key quaternions
+    transforms_key_t: Tensor = None,  # (N_k, B, 3, 4)  key transforms
+    pos_key_o: Tensor = None,    # (N_k, 3) key canonical positions
     lambda_iso: float = 1.0,
     lambda_rigid: float = 1.0,
     lambda_rot: float = 0.01,
     lambda_vel: float = 0.01,
     lambda_acc: float = 0.01,
 ) -> Tensor:
-    """Combined motion loss for non-key nodes (L_motion_non_key in Eq. 13)."""
+    """Combined motion loss for non-key nodes (L_motion_non_key in Eq. 13).
+    
+    Non-key nodes have key nodes as neighbors, so we pass key positions separately.
+    """
     loss = pos_t.new_zeros(())
     if lambda_iso > 0:
-        loss = loss + lambda_iso * isometry_loss(pos_t, pos_o, nonkey_nbrs_local, nonkey_nbr_weights)
+        loss = loss + lambda_iso * isometry_loss(
+            pos_t, pos_o, nonkey_nbrs_local, nonkey_nbr_weights,
+            pos_nbr_t=pos_key_t, pos_o_nbr=pos_key_o
+        )
     if lambda_rigid > 0:
-        loss = loss + lambda_rigid * rigidity_loss(pos_t, transforms_t, nonkey_nbrs_local, nonkey_nbr_weights)
+        loss = loss + lambda_rigid * rigidity_loss(
+            pos_t, transforms_t, nonkey_nbrs_local, nonkey_nbr_weights,
+            pos_nbr_t=pos_key_t, transforms_nbr_t=transforms_key_t
+        )
     if lambda_rot > 0:
-        loss = loss + lambda_rot * rotation_loss(quats_t, nonkey_nbrs_local, nonkey_nbr_weights)
+        loss = loss + lambda_rot * rotation_loss(
+            quats_t, nonkey_nbrs_local, nonkey_nbr_weights,
+            quats_nbr_t=quats_key_t
+        )
     if lambda_vel > 0:
         loss = loss + lambda_vel * velocity_loss(pos_t, quats_t)
     if lambda_acc > 0:
@@ -368,6 +416,11 @@ def non_key_node_loss(
     # DQB inputs
     R_key_t:             Tensor,  # (N_k, B, 3, 3) current key node rotations
     t_key_t:             Tensor,  # (N_k, B, 3)    current key node translations
+    # Motion loss inputs (key node info for neighbors)
+    pos_key_t:           Tensor,  # (N_k, B, 3)  current key positions
+    quats_key_t:         Tensor,  # (N_k, B, 4)  key quaternions
+    transforms_key_t:    Tensor,  # (N_k, B, 3, 4)  key transforms
+    pos_o_key:           Tensor,  # (N_k, 3)  key canonical positions
     nonkey_nbrs_local:   Tensor,  # (N_n, K+1)  indices into key_idx (local)
     nonkey_nbr_weights:  Tensor,  # (N_n, K+1)
     nonkey_nbrs_global:  Tensor,  # (N_n, K+1)  same but mapped to key-array indices (=nonkey_nbrs_local since we pass key subarrays)
@@ -421,6 +474,11 @@ def non_key_node_loss(
         pos_o=pos_o_nk,
         nonkey_nbrs_local=nonkey_nbrs_local,
         nonkey_nbr_weights=nonkey_nbr_weights,
+        # Pass key node info for neighbors
+        pos_key_t=pos_key_t,
+        quats_key_t=quats_key_t,
+        transforms_key_t=transforms_key_t,
+        pos_key_o=pos_o_key,
         lambda_iso=lambda_iso,
         lambda_rigid=lambda_rigid,
         lambda_rot=lambda_rot,

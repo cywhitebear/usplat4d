@@ -154,7 +154,7 @@ def main(cfg: USplat4DRunConfig):
         cfg.lr,
         cfg.loss,
         cfg.optim,
-        work_dir=cfg.som_dir,   # keeps SoM's internal bookkeeping pointing at its own dir
+        work_dir=cfg.out_dir,   # USplat4D output dir to avoid overwriting SoM checkpoint
         port=cfg.port,
     )
     guru.info(f"  SoM model loaded (epoch {start_epoch}, "
@@ -182,8 +182,22 @@ def main(cfg: USplat4DRunConfig):
     # Save config
     out_dir = cfg.out_dir
     os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(osp.join(out_dir, "checkpoints"), exist_ok=True)
+    
+    # Convert config to dict and recursively convert all tuples to lists for YAML compatibility
+    def _tuples_to_lists(obj):
+        """Recursively convert tuples to lists in dicts/lists."""
+        if isinstance(obj, dict):
+            return {k: _tuples_to_lists(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [_tuples_to_lists(item) for item in obj]
+        else:
+            return obj
+    
+    cfg_dict = _tuples_to_lists(asdict(cfg))
+    
     with open(osp.join(out_dir, "cfg.yaml"), "w") as f:
-        yaml.dump(asdict(cfg), f, default_flow_style=False)
+        yaml.dump(cfg_dict, f, default_flow_style=False)
     guru.info(f"Config saved to {out_dir}/cfg.yaml")
 
     # ---- Instantiate USplat4DTrainer --------------------------------------- #
