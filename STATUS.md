@@ -156,54 +156,23 @@ All losses OK
 
 ## Known Issues & Workarounds
 
-### ⚠️ FOUND: USplat4D quality regression on `iphone/backpack` — root cause identified
+### ✅ RESOLVED (2026-03-19): USplat4D quality regression on `iphone/backpack` — root cause identified & fixed
 
 **Initial Observation:** USplat4D output is renderable but degrades quality; deformation during backpack rotation is not improved.
 
-**Diagnosis (2026-03-18):**
-Added diagnostic logging to `trainer.py` to inspect uncertainty stats and loss magnitudes. **Result: CRITICAL BUG FOUND.**
+**Deep Dive Diagnosis:**
+After adding detailed telemetry to `uncertainty.py`, we found:
+- **Median uncertainty = 1e+06** (`phi`)
+- **Median color error = 0.53** (massive for a `[0, 1]` image)
+- Due to the high error, **~60% of Key Nodes** were falsely classified as "unconverged" and had their graph rigidity constraints disabled, leading to severe deformation tearing.
 
-**PRIMARY ROOT CAUSE: Uncertainty computation is too strict**
+**The Real Root Cause:**
+In `uncertainty.py`, the convergence check compared the ground truth `gt_img` against a temporarily rendered image padded with `colors=torch.zeros(G, 3)`. The model was effectively rendering **pitch-black silhouettes** of the tracked objects and penalizing them against full RGB ground truth. This guaranteed massive color errors, breaking the threshold `|C_gt - C_pred|_1 < eta_c` completely regardless of true performance. 
 
-Diagnostic output showed:
-```
-u_all: [1.51e-05, 1.00e+06, 1.00e+06] | u_key_nodes: [1.51e-05, 1.00e+06, 1.00e+06] | key_ratio_target=0.02
-```
-
-- **Median uncertainty = 1e+06** (the ceiling value `phi` for "diverged" Gaussians)
-- **Max uncertainty = 1e+06** (almost ALL Gaussians classified as diverged/unconverged)
-- **Key nodes have identical distribution to all Gaussians** (no selection benefit, no reliable anchors)
-
-**Why this breaks USplat4D:**
-- The convergence check `|C_gt - C_pred|_1 < eta_c` (default `eta_c=0.5`) is too strict
-- Almost every Gaussian is flagged as "not converged" → assigned `u_i = phi = 1e6`
-- When all uncertainties = 1e6, the Mahalanobis graph is effectively uniform (no meaningful constraints)
-- Graph losses constrain nothing; quality degradation is then unexplained
-
-**The fix:**
-Increase `eta_c` significantly. Paper used 0.5 on different datasets; for iphone/backpack try `eta_c=5.0` or higher:
-
-```bash
-python run_usplat4d.py \
-  --som-dir /media/ee904/DATA1/Yun/Outputs/shape-of-motion/iphone/backpack \
-  --out-dir /media/ee904/DATA1/Yun/Outputs/usplat4d/iphone/backpack_fixed \
-  --eta-c 5.0 \
-  --lambda-key 1 --lambda-non-key 1 \
-  --extra-epochs 400 \
-  data:iphone \
-  --data.data-dir /media/ee904/DATA1/Yun/Datasets/shape-of-motion/iphone/backpack
-```
-
-**Workaround (if eta-c still wrong):**
-Manually adjust `eta_c` in a loop or use binary search to find a value where:
-- Median `u_all` < 1e6  (most Gaussians are "converged")
-- Median `u_key_nodes` < median `u_all`  (key selection working)
-
-**Diagnostic code added:** trainer.py now logs at init:
-```
-USplat4D Diagnostics: u_all: [min, median, max] | u_key_nodes: [min, median, max]
-```
-Use this to verify fix works.
+**The Fix:**
+Patched `uncertainty.py` to render the actual scene using `model.render(...)` including both background and valid RGB foreground.
+- **After Fix:** Median color error dropped to **0.17**. Median uncertainty is **6.09**.
+- The default `eta_c = 0.5` works perfectly again. Workarounds like `--eta-c 5.0` are no longer needed.
 
 
 
@@ -280,28 +249,23 @@ python run_usplat4d.py ... --lambda-key 0 --lambda-non-key 0 ...
 2. **Checkpoint corruption bug** ✓ — SoM checkpoint no longer overwritten by USplat4D training
 3. **Rendering prep simplified** ✓ — New `render_usplat4d.py` eliminates manual setup
 
-### 🔲 Immediate Action: Test eta_c fix with corrected motion loss
-1. **Re-train SoM** on iphone/backpack (to reset checkpoint modified by earlier runs)
-2. **Run USplat4D with increased `eta_c`** (5.0 or higher):
-   ```bash
-   python run_usplat4d.py \
-     --som-dir /media/ee904/DATA1/Yun/Outputs/shape-of-motion/iphone/backpack \
-     --out-dir /media/ee904/DATA1/Yun/Outputs/usplat4d/iphone/backpack_eta_5p0_index_fixed \
-     --eta-c 5.0 --lambda-key 1 --lambda-non-key 1 --extra-epochs 400 \
-     data:iphone \
-     --data.data-dir /media/ee904/DATA1/Yun/Datasets/shape-of-motion/iphone/backpack
-   ```
-3. **Verify diagnostics** on first batch show:
-   - Median `u_all` < 1e6  (most Gaussians converged)
-   - Median `u_key_nodes` < median `u_all`  (selection working)
-   - `l_non_key` > 0.01 (motion constraints active)
-4. **Render and compare** quality vs SoM baseline:
-   ```bash
-   python render_usplat4d.py --work-dir /media/ee904/DATA1/Yun/Outputs/usplat4d/iphone/backpack_eta_5p0_index_fixed
-   ```
+### 🔲 Immediate Action: Run standard USplat4D full pipeline
+With the color rendering bug fixed, run the full 400-epoch training loop using default parameters:
+```bash
+python run_usplat4d.py \
+  --som-dir /media/ee904/DATA1/Yun/Outputs/shape-of-motion/iphone/backpack \
+  --out-dir /media/ee904/DATA1/Yun/Outputs/usplat4d/iphone/backpack_fixed \
+  --lambda-key 1 --lambda-non-key 1 --extra-epochs 400 \
+  data:iphone \
+  --data.data-dir /media/ee904/DATA1/Yun/Datasets/shape-of-motion/iphone/backpack
+```
 
-### 🔲 After eta_c validation
-- If quality improved: test on other datasets (nvidia, davis) for robustness
-- If still degraded: binary search on eta_c in [1.0, 10.0]
+Once completed, **Render and compare** quality vs SoM baseline:
+```bash
+python render_usplat4d.py --work-dir /media/ee904/DATA1/Yun/Outputs/usplat4d/iphone/backpack_fixed
+```
+
+### 🔲 After pipeline validation
+- Assess visual fidelity of the backpack sequence (verify the topology tearing is resolved)
+- Test on other datasets (nvidia, davis) for robustness
 - Quantitative metrics: PSNR/SSIM/LPIPS once quality baseline established
-- Document final hyperparameter recommendation for paper

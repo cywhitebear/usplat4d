@@ -38,6 +38,7 @@ def compute_uncertainty_single_frame(
     K: Tensor,             # (3, 3)  camera intrinsics
     img_wh: Tuple[int, int],  # (W, H)
     gt_img: Tensor,        # (H, W, 3)  ground-truth RGB in [0,1]
+    full_rendered_rgb: Tensor, # (H, W, 3) full scene rendered RGB in [0,1]
     eta_c: float = 0.5,    # color-error threshold for convergence check
     phi: float = 1e6,      # large constant for high-uncertainty Gaussians
     depth_margin_rel: float = 0.05,  # relative depth margin for occlusion test
@@ -135,6 +136,13 @@ def compute_uncertainty_single_frame(
                             torch.full_like(inv_sum_sq_v, phi))
         u[vis_idx] = u_vis
 
+        # Debug stats
+        debug_occluded_ratio = (~not_occluded).float().mean().item()
+        debug_raw_u = inv_sum_sq_v.detach().cpu()
+    else:
+        debug_occluded_ratio = 0.0
+        debug_raw_u = torch.tensor([])
+
     # ---------- 3. Convergence filter (Eq. 6–7) ----------
     # If any pixel covered by Gaussian i has color error > eta_c, set u_i = phi.
     # We check the projected center pixel as a proxy for the entire footprint.
@@ -143,29 +151,24 @@ def compute_uncertainty_single_frame(
         px = g_means2d[vis_idx, 0].round().long().clamp(0, W - 1)
         py = g_means2d[vis_idx, 1].round().long().clamp(0, H - 1)
 
-        # Render with actual colors for convergence check
-        with torch.enable_grad():
-            render_rgb_out, _, _ = rasterization(
-                means=means_t,
-                quats=quats_t,
-                scales=torch.exp(scales),
-                opacities=torch.sigmoid(opacities_raw),
-                colors=torch.zeros(G, 3, device=device),  # placeholder
-                viewmats=w2c.unsqueeze(0),
-                Ks=K.unsqueeze(0),
-                width=W,
-                height=H,
-                packed=False,
-                render_mode="RGB",
-            )
-        # render_rgb_out: (1, H, W, 3)
-        rendered_rgb = render_rgb_out[0]  # (H, W, 3)
-        color_err = (rendered_rgb[py, px] - gt_img[py, px]).abs().mean(dim=-1)  # (N_vis,)
+        # Use the provided full rendered image for convergence check
+        color_err = (full_rendered_rgb[py, px] - gt_img[py, px]).abs().mean(dim=-1)  # (N_vis,)
         not_converged = color_err > eta_c
         u[vis_idx] = torch.where(not_converged, torch.full_like(u[vis_idx], phi),
                                  u[vis_idx])
 
-    return u, g_radii
+        debug_color_err = color_err.detach().cpu()
+        debug_not_converged_ratio = not_converged.float().mean().item()
+    else:
+        debug_color_err = torch.tensor([])
+        debug_not_converged_ratio = 0.0
+
+    return u, g_radii, {
+        "occluded_ratio": debug_occluded_ratio,
+        "not_converged_ratio": debug_not_converged_ratio,
+        "raw_u": debug_raw_u,
+        "color_err": debug_color_err
+    }
 
 
 @torch.no_grad()
@@ -188,6 +191,10 @@ def compute_uncertainty_all_frames(
 
     img_wh = train_dataset.get_img_wh()  # (W, H)
 
+    all_color_errs = []
+    all_raw_u = []
+    fail_conv_ratios = []
+
     for t in range(T):
         # Get Gaussian positions at frame t
         with torch.no_grad():
@@ -206,7 +213,18 @@ def compute_uncertainty_all_frames(
         if gt_img.dim() == 4:
             gt_img = gt_img[0]
 
-        u_t, _ = compute_uncertainty_single_frame(
+        # Render the full scene (bg+fg) to correctly evaluate color convergence
+        with torch.no_grad():
+            rendered_dict = model.render(
+                t=t,
+                w2cs=w2c.unsqueeze(0),
+                Ks=K.unsqueeze(0),
+                img_wh=img_wh,
+                bg_color=0.0
+            )
+            full_rendered_rgb = rendered_dict["img"][0]  # (H, W, 3)
+
+        u_t, _, d_stats = compute_uncertainty_single_frame(
             means_t=means_t,
             quats_t=quats_t,
             scales=model.fg.params["scales"],
@@ -215,11 +233,33 @@ def compute_uncertainty_all_frames(
             K=K,
             img_wh=img_wh,
             gt_img=gt_img,
+            full_rendered_rgb=full_rendered_rgb,
             eta_c=eta_c,
             phi=phi,
             depth_margin_rel=depth_margin_rel,
         )
         u_all[:, t] = u_t
+
+        all_color_errs.append(d_stats["color_err"])
+        all_raw_u.append(d_stats["raw_u"])
+        fail_conv_ratios.append(d_stats["not_converged_ratio"])
+        
+    # --- Print massive debug summary ---
+    try:
+        from loguru import logger as guru
+        all_errs = torch.cat(all_color_errs)
+        all_u = torch.cat(all_raw_u)
+        q_err = torch.quantile(all_errs.float(), torch.tensor([0.5, 0.9, 0.95, 0.99]))
+        q_u = torch.quantile(all_u.float(), torch.tensor([0.1, 0.5, 0.9]))
+        guru.info(f"=== UNCERTAINTY STATS (eta_c={eta_c}, phi={phi}) ===")
+        guru.info(f"  Color Err Percentiles: p50={q_err[0]:.4f}, p90={q_err[1]:.4f}, p95={q_err[2]:.4f}, p99={q_err[3]:.4f}")
+        guru.info(f"  Avg Convergence Failure Ratio: {sum(fail_conv_ratios)/max(1, len(fail_conv_ratios))*100:.1f}%")
+        guru.info(f"  Raw `u` (inv_sum_sq_v) Percentiles: p10={q_u[0]:.6f}, p50={q_u[1]:.6f}, p90={q_u[2]:.6f}")
+        phi_hit_ratio = (u_all == phi).float().mean().item()
+        guru.info(f"  Final u==phi ratio covering all frames: {phi_hit_ratio*100:.1f}%")
+        guru.info("==================================================")
+    except Exception as e:
+        pass
 
     return u_all  # (G, T)
 
