@@ -240,9 +240,131 @@ python run_usplat4d.py ... --lambda-key 0 --lambda-non-key 1 ...
 python run_usplat4d.py ... --lambda-key 0 --lambda-non-key 0 ...
 ```
 
+### Guiding Principles
+- **Don't blindly tune hyperparameters.** Observe the output, analyze the intermediate data (losses, gradients, uncertainty), and form a hypothesis about the root cause before changing parameters. Find the problem, don't just tweak the knobs.
+
+### Enhanced Diagnostic Logging (2026-03-20)
+Added comprehensive training diagnostics to identify optimization issues and prevent endless hyperparameter tweaking:
+
+**Features:**
+- **CSV diagnostic log** written to `{work_dir}/usplat4d/diagnostics.csv`
+- **Tracked metrics:**
+  - *Loss breakdown:* Individual motion components (iso, rigid, rot, vel, acc) for both key and non-key nodes
+  - *Uncertainty stats:* Min/median/max for all Gaussians and per-node-type (key/non-key), unconverged count
+  - *Position deviations:* Mean/max distance from pretrained positions (key/non-key)
+- **Logging frequency:** Every N steps (default 10) during training
+
+**Analysis of backpack_log_report run (2026-03-24):**
+🔴 **CRITICAL FINDING (Now Updated 2026-04-02):** 
+- The convergence check works correctly - only 5.7% fail convergence (not 100%)
+- Color error median: 0.1656 (well below eta_c=0.5)
+- **Actual bug: Key node selection is picking MOSTLY UNCONVERGED Gaussians**
+
+**Root Cause - Graph Building Bug:**
+The key node selection algorithm uses voxelization + SPT (significant period) filtering, then ranks by average uncertainty (ascending = lowest first). However:
+- Tau threshold (20th percentile) set too low, filtering out good candidates
+- Voxel gridization selects only 1 candidate per voxel with any low-u Gaussian
+- SPT filter (5 frames minimum) may over-filter reliable nodes
+- Result: By the time we select top 2%, we're picking from a depleted pool dominated by HIGH-u Gaussians
+
+**Evidence from fresh 1-epoch run (2026-04-02):**
+- Final u==phi ratio: 38.1% (across all frames)
+- Convergence failure rate: 5.7% (acceptable)
+- But u_key_nodes: [min=6.96e-05, median=1.00e+06, max=1.00e+06] ← **BUG: median is phi!**
+
+**Solution Needed:**
+Adjust graph building parameters (tau_percentile, spt_threshold) or rethink key node selection to avoid picking unconverged Gaussians as key nodes.
+
 ---
 
-## Next Steps
+## Deep Dive: Key Node Selection Bug Investigation (2026-04-02)
+
+### Investigation Technique: "Don't Blindly Tune"
+User requested: **Before changing code, check what the paper says about the algorithm and understand what tau means.**
+
+### What is `tau`?
+**Definition:** `tau` = uncertainty threshold that separates "reliable" from "unreliable" Gaussians
+- Computed as: `tau = quantile(all_uncertainties, u_tau_percentile)`
+- Current implementation: `u_tau_percentile = 0.20` (20th percentile)
+- This means: only bottom 20% of Gaussians qualify as "low-u", rest are "high-u"
+
+**How tau is used:**
+1. Voxelization stage: voxels containing ONLY high-u Gaussians (all u ≥ tau) are discarded
+2. SPT filtering: counts frames where u < tau (must have ≥5 frames to survive)
+3. Final ranking: selects by lowest average uncertainty
+
+### Paper Quote on Graph Construction
+From Section 4.2 of USplat4D paper:
+> "For each Gaussian candidate, we compute its significant period, defined as the number of frames where its uncertainty stays **below a threshold**. We retain only those with a significant period of at least 5 frames."
+
+**Key finding:** Paper does NOT specify what the threshold should be — it's left as an implementation choice.
+
+### Test 1: Change tau from 20th to 50th percentile
+
+**Before (tau = 0.0236, 20th percentile):**
+- Candidates after voxelization: 449
+- Candidate pool: median mean_u = 5.33e+05 (very high)
+- Final u_key_nodes median: **1e6 (phi)** ← BUG
+
+**After (tau = 5.41, 50th percentile):**
+- Candidates after voxelization: 513 (slightly more)
+- Candidate pool: median mean_u = 5.39e+05 (still very high!)
+- Final u_key_nodes median: **Still 1e6 (phi)** ← BUG PERSISTS
+
+**Conclusion:** Changing tau percentile alone doesn't solve it. Problem is in the ranking algorithm, not the threshold.
+
+### Improved Diagnostics: Understanding Key Node Quality
+
+**Added to trainer.py** (2026-04-02):
+- Per-key-node best-frame uncertainty: min across all T frames
+- Per-key-node average uncertainty: mean across all T frames  
+- Ratio: percentage of (key_node, frame) pairs with u < phi
+
+**Output from test with tau=50th percentile:**
+```
+u_key (best frame):   [6.79e-05, 1.66e-02, 5.31e+00]     ← best frame of each key node
+u_key (avg time):     [1.67e+04, 5.28e+05, 9.72e+05]     ← average across all frames
+{key_frames < phi:    48.2%}                             ← only 48% unconverged, 52% are phi
+```
+
+**Interpretation:**
+- ✅ Good: Each key node HAS at least one good frame (best = 0.0166)
+- ❌ Bad: But on average they're still very uncertain (5.28e+05)
+- ❌ Bad: **51.8% of all key-node-frame pairs are unconverged (u == phi)**
+
+### Root Cause: Ranking by Average Uncertainty
+
+**Current algorithm in graph.py line 182:**
+```python
+mean_u = u_scalar[candidates].mean(dim=1)  # Average over ALL frames  
+top = mean_u.topk(max_key, largest=False).indices  # Pick lowest average
+```
+
+**The problem:** A Gaussian that fails convergence in even 50% of frames will have average u heavily pulled toward phi (1e6), making it uncompetitive for key node selection despite being good in the other 50% of frames.
+
+**Calculated ratio (48.2% < phi):**
+- N_k = 505 key nodes
+- T ≈ 400 frames
+- Total pairs = 202,000
+- Only 48.2% have u < phi = 97,464 pairs
+- The other 104,536 pairs are phi (unconverged)
+
+### Recommendation for Next Session
+
+**Option A: Rank by "best frame" instead of average**
+- Current: `mean_u = u_scalar[candidates].mean(dim=1)`
+- Try: `best_u = u_scalar[candidates].min(dim=1).values`
+- Rationale: Prioritize Gaussians that are reliable in at least their best frame
+
+**Option B: Filter by convergence consistency**
+- Require: ≥ 80–90% of frames have u < phi (not just "u < tau")
+- Rationale: Key nodes should be consistently converged, not flaky
+
+**Option C: Both - rank by best-frame AND filter by consistency**
+- Would ensure key nodes are both reliably observed AND frequently converged
+
+---
+
 
 ### ✅ Completed: Critical bugs fixed (2026-03-18)
 1. **Secondary index bug** ✓ — Key nodes now correctly indexed in motion losses

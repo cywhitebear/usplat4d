@@ -16,8 +16,9 @@ References:
 from __future__ import annotations
 
 import copy
+import csv
 import os
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 
 import torch
 import torch.nn.functional as F
@@ -32,7 +33,10 @@ from flow3d.trainer import Trainer as SoMTrainer
 # USplat4D imports
 from usplat4d.uncertainty import compute_uncertainty_all_frames, build_uncertainty_3d_matrices
 from usplat4d.graph import build_graph, USplat4DGraph
-from usplat4d.losses import key_node_loss, non_key_node_loss
+from usplat4d.losses import (
+    key_node_loss, non_key_node_loss,
+    isometry_loss, rigidity_loss, rotation_loss, velocity_loss, acceleration_loss,
+)
 
 
 class USplat4DConfig:
@@ -101,6 +105,10 @@ class USplat4DTrainer:
 
         os.makedirs(os.path.join(self.work_dir, "usplat4d"), exist_ok=True)
 
+        # Initialize diagnostic log file
+        self.log_file = os.path.join(self.work_dir, "usplat4d", "diagnostics.csv")
+        self._init_log_file()
+
         # ------------------------------------------------------------------ #
         #  Step 1: pre-compute per-Gaussian uncertainties (Section 4.1)       #
         # ------------------------------------------------------------------ #
@@ -142,13 +150,27 @@ class USplat4DTrainer:
             f"{len(self.graph.nonkey_idx)} non-key nodes"
         )
         # Diagnostic: key node uncertainty stats
-        u_key_nodes = self.u_scalar[self.graph.key_idx]
+        u_key_nodes = self.u_scalar[self.graph.key_idx]  # (N_k, T)
         u_all = self.u_scalar
+        
+        # Per-key-node: best (min) and worst (max) uncertainty across time
+        u_key_min_per_node = u_key_nodes.min(dim=1).values  # (N_k,) - best frame
+        u_key_max_per_node = u_key_nodes.max(dim=1).values  # (N_k,) - worst frame
+        u_key_avg_per_node = u_key_nodes.mean(dim=1)  # (N_k,) - average across time
+        
+        # Ratio: how many (key, frame) pairs have u < tau (phi threshold)?
+        phi_threshold = 1e6
+        key_below_phi = (u_key_nodes < phi_threshold).sum().item()
+        key_total = u_key_nodes.numel()
+        key_phi_ratio = 100 * key_below_phi / key_total if key_total > 0 else 0
+        
         guru.info(
             f"USplat4D Diagnostics:"
             f" u_all: [{u_all.min():.2e}, {u_all.median():.2e}, {u_all.max():.2e}] "
-            f"| u_key_nodes: [{u_key_nodes.min():.2e}, {u_key_nodes.median():.2e}, {u_key_nodes.max():.2e}] "
-            f"| key_ratio_target={self.cfg.key_ratio}"
+            f"| u_key (best frame): [{u_key_min_per_node.min():.2e}, {u_key_min_per_node.median():.2e}, {u_key_min_per_node.max():.2e}] "
+            f"| u_key (avg time): [{u_key_avg_per_node.min():.2e}, {u_key_avg_per_node.median():.2e}, {u_key_avg_per_node.max():.2e}] "
+            f"| key_ratio_target={self.cfg.key_ratio} "
+            f"| {{key_frames < phi: {key_phi_ratio:.1f}%}}"
         )
 
         # ------------------------------------------------------------------ #
@@ -172,17 +194,77 @@ class USplat4DTrainer:
         self._som_compute_losses = som_trainer.compute_losses
 
     # ----------------------------------------------------------------------- #
+    #  Diagnostic logging                                                      #
+    # ----------------------------------------------------------------------- #
+
+    def _init_log_file(self):
+        """Initialize the CSV log file with headers."""
+        headers = [
+            "epoch", "global_step", "loss_key", "loss_non_key",
+            "l_iso_key", "l_rigid_key", "l_rot_key", "l_vel_key", "l_acc_key",
+            "l_iso_nk", "l_rigid_nk", "l_rot_nk", "l_vel_nk", "l_acc_nk",
+            "u_min", "u_median", "u_max", "u_key_min", "u_key_median", "u_key_max",
+            "u_nk_min", "u_nk_median", "u_nk_max",
+            "pos_dev_key_mean", "pos_dev_key_max", "pos_dev_nk_mean", "pos_dev_nk_max",
+            "unconverged_count", "key_count", "nonkey_count"
+        ]
+        with open(self.log_file, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+        guru.info(f"Diagnostic log initialized → {self.log_file}")
+
+    def log_diagnostics(self, epoch: int, loss_dict: Dict[str, Any]):
+        """Write comprehensive diagnostics to the log file.
+        
+        Args:
+            epoch: Current epoch number.
+            loss_dict: Dictionary of loss components (output from compute_usplat4d_losses_detailed).
+        """
+        row = [
+            epoch,
+            self.som_trainer.global_step,
+            loss_dict.get("loss_key", 0.0),
+            loss_dict.get("loss_non_key", 0.0),
+            loss_dict.get("l_iso_key", 0.0),
+            loss_dict.get("l_rigid_key", 0.0),
+            loss_dict.get("l_rot_key", 0.0),
+            loss_dict.get("l_vel_key", 0.0),
+            loss_dict.get("l_acc_key", 0.0),
+            loss_dict.get("l_iso_nk", 0.0),
+            loss_dict.get("l_rigid_nk", 0.0),
+            loss_dict.get("l_rot_nk", 0.0),
+            loss_dict.get("l_vel_nk", 0.0),
+            loss_dict.get("l_acc_nk", 0.0),
+            loss_dict.get("u_min", 0.0),
+            loss_dict.get("u_median", 0.0),
+            loss_dict.get("u_max", 0.0),
+            loss_dict.get("u_key_min", 0.0),
+            loss_dict.get("u_key_median", 0.0),
+            loss_dict.get("u_key_max", 0.0),
+            loss_dict.get("u_nk_min", 0.0),
+            loss_dict.get("u_nk_median", 0.0),
+            loss_dict.get("u_nk_max", 0.0),
+            loss_dict.get("pos_dev_key_mean", 0.0),
+            loss_dict.get("pos_dev_key_max", 0.0),
+            loss_dict.get("pos_dev_nk_mean", 0.0),
+            loss_dict.get("pos_dev_nk_max", 0.0),
+            loss_dict.get("unconverged_count", 0),
+            loss_dict.get("key_count", 0),
+            loss_dict.get("nonkey_count", 0),
+        ]
+        with open(self.log_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
+
+    # ----------------------------------------------------------------------- #
     #  Core loss injection                                                      #
     # ----------------------------------------------------------------------- #
 
-    def compute_usplat4d_losses(self, ts: Tensor, log_first_batch: bool = True) -> Tensor:
-        """Compute USplat4D graph losses for a set of sampled frame indices.
-
-        Args:
-            ts: (B,) frame indices (int64) — same as SoM training batch 'ts'.
-
+    def compute_usplat4d_losses_detailed(self, ts: Tensor) -> Tuple[Tensor, Dict[str, float]]:
+        """Compute USplat4D losses with detailed component breakdown.
+        
         Returns:
-            Scalar tensor: L_key + L_non_key.
+            (total_loss, detailed_stats_dict)
         """
         B = ts.shape[0]
         device = self.device
@@ -191,17 +273,13 @@ class USplat4DTrainer:
         nonkey_idx = self.graph.nonkey_idx  # (N_n,)
 
         # ---- Current positions (differentiable) ---- #
-        # Recompute positions for the sampled frames so gradients flow.
         means_fg_t, quats_fg_t = self.model.compute_poses_fg(ts)
-        # means_fg_t: (G_fg, B, 3)  quats_fg_t: (G_fg, B, 4)
-
-        # Subset to key / non-key nodes
+        
         pos_key_t  = means_fg_t[key_idx]    # (N_k, B, 3)
         quats_key_t = quats_fg_t[key_idx]   # (N_k, B, 4)
         pos_nk_t   = means_fg_t[nonkey_idx] # (N_n, B, 3)
         quats_nk_t = quats_fg_t[nonkey_idx] # (N_n, B, 4)
 
-        # SE(3) transforms for key nodes (needed for rigid/DQB)
         transforms_key = self.model.compute_transforms(ts, inds=key_idx)  # (N_k, B, 3, 4)
         transforms_nk  = self.model.compute_transforms(ts, inds=nonkey_idx)  # (N_n, B, 3, 4)
 
@@ -209,7 +287,6 @@ class USplat4DTrainer:
         t_key_t = transforms_key[..., :3, 3]   # (N_k, B, 3)
 
         # ---- Pretrained (frozen) reference positions ---- #
-        # Index into (G_fg, T, 3) by [key_idx / nonkey_idx] and [ts]
         ts_cpu = ts.cpu()
         pos_key_pre = self.p_pretrained_fg[key_idx][:, ts_cpu].to(device)   # (N_k, B, 3)
         pos_nk_pre  = self.p_pretrained_fg[nonkey_idx][:, ts_cpu].to(device) # (N_n, B, 3)
@@ -225,15 +302,15 @@ class USplat4DTrainer:
         pos_o_key = self.p_canonical_fg[key_idx]    # (N_k, 3)
         pos_o_nk  = self.p_canonical_fg[nonkey_idx] # (N_n, 3)
 
-        # ---- Key node neighbors (local indices within key_idx array) ---- #
-        key_nbrs_local   = self.graph.key_nbrs          # (N_k, K) 0..N_k-1
+        # ---- Key node neighbors ---- #
+        key_nbrs_local   = self.graph.key_nbrs          # (N_k, K)
         key_nbr_weights  = self.graph.key_nbr_weights   # (N_k, K)
 
-        # ---- Non-key node neighbors (indices into key_idx array) ---- #
-        nonkey_nbrs_local   = self.graph.nonkey_nbrs         # (N_n, K+1) indices into key nodes
+        # ---- Non-key node neighbors ---- #
+        nonkey_nbrs_local   = self.graph.nonkey_nbrs         # (N_n, K+1)
         nonkey_nbr_weights  = self.graph.nonkey_nbr_weights  # (N_n, K+1)
 
-        # ---- Key loss (Eq. 11) ---- #
+        # Compute key and non-key losses using the high-level functions
         l_key = key_node_loss(
             pos_key_t=pos_key_t,
             quats_key_t=quats_key_t,
@@ -252,7 +329,6 @@ class USplat4DTrainer:
             lambda_acc=self.cfg.lambda_acc,
         )
 
-        # ---- Non-key loss (Eq. 13) ---- #
         l_non_key = non_key_node_loss(
             pos_nk_t=pos_nk_t,
             quats_nk_t=quats_nk_t,
@@ -261,16 +337,15 @@ class USplat4DTrainer:
             u_nk=u_nk,
             R_wc_t=R_wc_t,
             pos_o_nk=pos_o_nk,
-            R_key_t=R_key_t,         # current key node rotations
-            t_key_t=t_key_t,         # current key node translations
-            # Motion loss: key node positions, quats, transforms, canonical positions
+            R_key_t=R_key_t,
+            t_key_t=t_key_t,
             pos_key_t=pos_key_t,
             quats_key_t=quats_key_t,
             transforms_key_t=transforms_key,
             pos_o_key=pos_o_key,
             nonkey_nbrs_local=nonkey_nbrs_local,
             nonkey_nbr_weights=nonkey_nbr_weights,
-            nonkey_nbrs_global=nonkey_nbrs_local,  # same (keys indexed 0..N_k-1)
+            nonkey_nbrs_global=nonkey_nbrs_local,
             r_scale=self.cfg.r_scale,
             lambda_iso=self.cfg.lambda_iso,
             lambda_rigid=self.cfg.lambda_rigid,
@@ -279,25 +354,95 @@ class USplat4DTrainer:
             lambda_acc=self.cfg.lambda_acc,
         )
 
-        # Log diagnostics on first batch
-        if not self._first_batch_logged and self.som_trainer.global_step == 0:
-            self._first_batch_logged = True
-            with torch.no_grad():
-                pos_dev_key = (pos_key_t - pos_key_pre).norm(dim=-1).mean()
-                pos_dev_nk = (pos_nk_t - pos_nk_pre).norm(dim=-1).mean()
-                guru.info(
-                    f"USplat4D First Batch Diagnostics:\n"
-                    f"  l_key={l_key.item():.4f}, l_non_key={l_non_key.item():.4f}\n"
-                    f"  pos_dev_key (||p_curr - p_pretrained||): {pos_dev_key:.4f}\n"
-                    f"  pos_dev_nk: {pos_dev_nk:.4f}\n"
-                    f"  u_key shape: {u_key.shape}, range: [{u_key.min():.2e}, {u_key.max():.2e}]\n"
-                    f"  u_nk shape: {u_nk.shape}, range: [{u_nk.min():.2e}, {u_nk.max():.2e}]"
-                )
+        # Compute individual motion loss components for key nodes
+        with torch.no_grad():
+            l_iso_key = isometry_loss(
+                pos_t=pos_key_t, pos_o=pos_o_key,
+                nbr_idx=key_nbrs_local, weights=key_nbr_weights
+            )
+            l_rigid_key = rigidity_loss(
+                pos_t=pos_key_t, transforms_t=transforms_key,
+                nbr_idx=key_nbrs_local, weights=key_nbr_weights
+            )
+            l_rot_key = rotation_loss(
+                quats_t=quats_key_t, nbr_idx=key_nbrs_local, weights=key_nbr_weights
+            )
+            l_vel_key = velocity_loss(
+                pos_t=pos_key_t, quats_t=quats_key_t, delta=1
+            )
+            l_acc_key = acceleration_loss(
+                pos_t=pos_key_t, quats_t=quats_key_t, delta=1
+            )
 
-        return self.cfg.lambda_key * l_key + self.cfg.lambda_non_key * l_non_key, {
-            "usplat4d/l_key": l_key.item(),
-            "usplat4d/l_non_key": l_non_key.item(),
+            # Compute individual motion loss components for non-key nodes
+            l_iso_nk = isometry_loss(
+                pos_t=pos_nk_t, pos_o=pos_o_nk,
+                nbr_idx=nonkey_nbrs_local, weights=nonkey_nbr_weights,
+                pos_nbr_t=pos_key_t, pos_o_nbr=pos_o_key
+            )
+            l_rigid_nk = rigidity_loss(
+                pos_t=pos_nk_t, transforms_t=transforms_nk,
+                nbr_idx=nonkey_nbrs_local, weights=nonkey_nbr_weights,
+                pos_nbr_t=pos_key_t, transforms_nbr_t=transforms_key
+            )
+            l_rot_nk = rotation_loss(
+                quats_t=quats_nk_t, nbr_idx=nonkey_nbrs_local, weights=nonkey_nbr_weights,
+                quats_nbr_t=quats_key_t
+            )
+            l_vel_nk = velocity_loss(
+                pos_t=pos_nk_t, quats_t=quats_nk_t, delta=1
+            )
+            l_acc_nk = acceleration_loss(
+                pos_t=pos_nk_t, quats_t=quats_nk_t, delta=1
+            )
+
+            # Uncertainty statistics
+            u_all = self.u_scalar
+            unconverged_count = (self.u_scalar >= self.cfg.phi * 0.99).sum().item()
+
+            # Position deviation statistics
+            pos_dev_key = (pos_key_t - pos_key_pre).norm(dim=-1)  # (N_k, B)
+            pos_dev_nk = (pos_nk_t - pos_nk_pre).norm(dim=-1)     # (N_n, B)
+
+        total_loss = self.cfg.lambda_key * l_key + self.cfg.lambda_non_key * l_non_key
+
+        stats = {
+            "loss_total": total_loss.item(),
+            "loss_key": l_key.item(),
+            "loss_non_key": l_non_key.item(),
+            "l_iso_key": l_iso_key.item(),
+            "l_rigid_key": l_rigid_key.item(),
+            "l_rot_key": l_rot_key.item(),
+            "l_vel_key": l_vel_key.item(),
+            "l_acc_key": l_acc_key.item(),
+            "l_iso_nk": l_iso_nk.item(),
+            "l_rigid_nk": l_rigid_nk.item(),
+            "l_rot_nk": l_rot_nk.item(),
+            "l_vel_nk": l_vel_nk.item(),
+            "l_acc_nk": l_acc_nk.item(),
+            "u_min": u_all.min().item(),
+            "u_median": u_all.median().item(),
+            "u_max": u_all.max().item(),
+            "u_key_min": u_key.min().item(),
+            "u_key_median": u_key.median().item(),
+            "u_key_max": u_key.max().item(),
+            "u_nk_min": u_nk.min().item(),
+            "u_nk_median": u_nk.median().item(),
+            "u_nk_max": u_nk.max().item(),
+            "pos_dev_key_mean": pos_dev_key.mean().item(),
+            "pos_dev_key_max": pos_dev_key.max().item(),
+            "pos_dev_nk_mean": pos_dev_nk.mean().item(),
+            "pos_dev_nk_max": pos_dev_nk.max().item(),
+            "unconverged_count": unconverged_count,
+            "key_count": len(key_idx),
+            "nonkey_count": len(nonkey_idx),
         }
+
+        return total_loss, stats
+
+    def compute_usplat4d_losses(self, ts: Tensor) -> Tuple[Tensor, Dict[str, float]]:
+        """Wrapper around compute_usplat4d_losses_detailed for backward compatibility."""
+        return self.compute_usplat4d_losses_detailed(ts)
 
     # ----------------------------------------------------------------------- #
     #  Patched train_step: inject graph losses into SoM's compute_losses       #
@@ -327,6 +472,7 @@ class USplat4DTrainer:
         train_loader,
         extra_epochs: Optional[int] = None,
         disable_density_control_fraction: float = 0.1,
+        log_every_n_steps: int = 10,
     ):
         """Fine-tune the SoM model with USplat4D graph losses.
 
@@ -338,6 +484,7 @@ class USplat4DTrainer:
             extra_epochs: Override cfg.extra_epochs if provided.
             disable_density_control_fraction: Fraction of epochs at the START
                 (and last 20%) during which density control is paused.
+            log_every_n_steps: Log diagnostics every N training steps.
         """
         n_epochs = extra_epochs or self.cfg.extra_epochs
         start_epoch = self.som_trainer.epoch
@@ -348,6 +495,7 @@ class USplat4DTrainer:
 
         guru.info(f"USplat4D: starting fine-tuning for {n_epochs} extra epochs "
                   f"(from epoch {start_epoch})")
+        guru.info(f"USplat4D: diagnostic log → {self.log_file}")
 
         epoch_bar = tqdm(
             range(start_epoch, start_epoch + n_epochs),
@@ -355,6 +503,8 @@ class USplat4DTrainer:
             unit="epoch",
             dynamic_ncols=True,
         )
+        step_counter = 0
+        
         try:
             for epoch in epoch_bar:
                 self.som_trainer.set_epoch(epoch)
@@ -385,6 +535,15 @@ class USplat4DTrainer:
                     }
                     loss_val = self.som_trainer.train_step(batch)
                     batch_bar.set_postfix(loss=f"{loss_val:.4f}")
+
+                    # Log diagnostics periodically
+                    if step_counter % log_every_n_steps == 0:
+                        ts = batch["ts"].to(self.device)
+                        with torch.no_grad():
+                            _, loss_dict = self.compute_usplat4d_losses_detailed(ts)
+                        self.log_diagnostics(epoch, loss_dict)
+                    
+                    step_counter += 1
 
                 epoch_bar.set_postfix(loss=f"{loss_val:.4f}", dc_off=disable_dc)
 

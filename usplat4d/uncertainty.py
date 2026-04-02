@@ -159,6 +159,16 @@ def compute_uncertainty_single_frame(
 
         debug_color_err = color_err.detach().cpu()
         debug_not_converged_ratio = not_converged.float().mean().item()
+        
+        # DEBUG: Print sample color errors to diagnose convergence check issue
+        try:
+            from loguru import logger as guru
+            if len(color_err) > 0:
+                guru.debug(f"  Frame convergence: {debug_not_converged_ratio*100:.1f}% unconverged | "
+                          f"color_err: min={color_err.min():.4f}, median={color_err.median():.4f}, max={color_err.max():.4f} | "
+                          f"eta_c={eta_c}")
+        except:
+            pass
     else:
         debug_color_err = torch.tensor([])
         debug_not_converged_ratio = 0.0
@@ -194,6 +204,9 @@ def compute_uncertainty_all_frames(
     all_color_errs = []
     all_raw_u = []
     fail_conv_ratios = []
+    
+    from loguru import logger as guru
+    guru.info(f"USplat4D: Computing uncertainties for {T} frames with eta_c={eta_c}, phi={phi}")
 
     for t in range(T):
         # Get Gaussian positions at frame t
@@ -223,6 +236,21 @@ def compute_uncertainty_all_frames(
                 bg_color=0.0
             )
             full_rendered_rgb = rendered_dict["img"][0]  # (H, W, 3)
+        
+        # DEBUG: Check rendered image statistics
+        rgb_min = full_rendered_rgb.min().item()
+        rgb_max = full_rendered_rgb.max().item()
+        rgb_mean = full_rendered_rgb.mean().item()
+        gt_min = gt_img.min().item()
+        gt_max = gt_img.max().item()
+        gt_mean = gt_img.mean().item()
+        
+        if t % max(1, T // 5) == 0:  # Print for ~5 frames
+            try:
+                guru.debug(f"  Frame {t}: rendered RGB [{rgb_min:.4f},{rgb_max:.4f}], mean={rgb_mean:.4f} | "
+                          f"gt RGB [{gt_min:.4f},{gt_max:.4f}], mean={gt_mean:.4f}")
+            except:
+                pass
 
         u_t, _, d_stats = compute_uncertainty_single_frame(
             means_t=means_t,
@@ -247,14 +275,20 @@ def compute_uncertainty_all_frames(
     # --- Print massive debug summary ---
     try:
         from loguru import logger as guru
-        all_errs = torch.cat(all_color_errs)
-        all_u = torch.cat(all_raw_u)
-        q_err = torch.quantile(all_errs.float(), torch.tensor([0.5, 0.9, 0.95, 0.99]))
-        q_u = torch.quantile(all_u.float(), torch.tensor([0.1, 0.5, 0.9]))
-        guru.info(f"=== UNCERTAINTY STATS (eta_c={eta_c}, phi={phi}) ===")
-        guru.info(f"  Color Err Percentiles: p50={q_err[0]:.4f}, p90={q_err[1]:.4f}, p95={q_err[2]:.4f}, p99={q_err[3]:.4f}")
-        guru.info(f"  Avg Convergence Failure Ratio: {sum(fail_conv_ratios)/max(1, len(fail_conv_ratios))*100:.1f}%")
-        guru.info(f"  Raw `u` (inv_sum_sq_v) Percentiles: p10={q_u[0]:.6f}, p50={q_u[1]:.6f}, p90={q_u[2]:.6f}")
+        all_errs = torch.cat(all_color_errs) if all_color_errs else torch.tensor([])
+        all_u = torch.cat(all_raw_u) if all_raw_u else torch.tensor([])
+        
+        if len(all_errs) > 0:
+            q_err = torch.quantile(all_errs.float(), torch.tensor([0.25, 0.5, 0.75, 0.9, 0.95, 0.99]))
+            guru.info(f"=== UNCERTAINTY STATS (eta_c={eta_c}, phi={phi}) ===")
+            guru.info(f"  Color Err Percentiles: p25={q_err[0]:.4f}, p50={q_err[1]:.4f}, p75={q_err[2]:.4f}, p90={q_err[3]:.4f}, p95={q_err[4]:.4f}, p99={q_err[5]:.4f}")
+            guru.info(f"  Color Err < eta_c: {(all_errs < eta_c).float().mean().item() * 100:.1f}%")
+            guru.info(f"  Avg Convergence Failure Ratio: {sum(fail_conv_ratios)/max(1, len(fail_conv_ratios))*100:.1f}%")
+        
+        if len(all_u) > 0:
+            q_u = torch.quantile(all_u.float(), torch.tensor([0.1, 0.5, 0.9]))
+            guru.info(f"  Raw `u` (inv_sum_sq_v) Percentiles: p10={q_u[0]:.6f}, p50={q_u[1]:.6f}, p90={q_u[2]:.6f}")
+        
         phi_hit_ratio = (u_all == phi).float().mean().item()
         guru.info(f"  Final u==phi ratio covering all frames: {phi_hit_ratio*100:.1f}%")
         guru.info("==================================================")

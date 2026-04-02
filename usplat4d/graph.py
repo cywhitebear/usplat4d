@@ -56,7 +56,7 @@ def build_graph(
     spt_threshold: int = 5,        # significant period threshold (min #frames with u < tau)
     voxel_size: Optional[float] = None,  # 3D voxel size; auto if None
     knn_k: int = 8,                # number of key-key neighbors per key node
-    u_tau_percentile: float = 0.20, # uncertainty percentile below which a Gaussian is "low-u"
+    u_tau_percentile: float = 0.50, # uncertainty percentile below which a Gaussian is "low-u"
     device: Optional[torch.device] = None,
 ) -> USplat4DGraph:
     """Build the uncertainty-encoded spatio-temporal graph.
@@ -85,6 +85,15 @@ def build_graph(
     if finite_u.numel() == 0:
         raise RuntimeError("All uncertainties are non-finite; check rendering output.")
     tau = torch.quantile(finite_u, u_tau_percentile).item()
+    
+    # DEBUG: Log tau threshold
+    try:
+        from loguru import logger as guru
+        phi_count = (u_scalar == 1e6).sum().item()
+        guru.info(f"Graph selection: tau (20th percentile) = {tau:.6f}, "
+                 f"phi instances = {phi_count}/{u_scalar.numel()} ({100*phi_count/u_scalar.numel():.1f}%)")
+    except:
+        pass
 
     low_u_mask = u_scalar < tau  # (G, T)  True where Gaussian is reliable
 
@@ -126,12 +135,37 @@ def build_graph(
     if len(candidates) == 0:
         raise RuntimeError("No key node candidates found; try relaxing u_tau_percentile.")
     candidates = torch.cat(candidates)  # (N_cand,)
+    
+    # DEBUG: Report candidates after voxelization
+    try:
+        from loguru import logger as guru
+        cand_u = u_scalar[candidates]  # (N_cand, T)
+        mean_u_before_spt = cand_u.mean(dim=1)
+        guru.info(f"After voxelization: {candidates.numel()} candidates | "
+                 f"mean_u: min={mean_u_before_spt.min():.2e}, median={mean_u_before_spt.median():.2e}, "
+                 f"max={mean_u_before_spt.max():.2e}")
+    except:
+        pass
 
     # Stage 2: Filter by significant period >= spt_threshold
     # Significant period = number of frames where u < tau
     sig_period = low_u_mask[candidates].sum(dim=1)  # (N_cand,)
     valid = sig_period >= spt_threshold
+    candidates_before_spt = candidates.clone()
     candidates = candidates[valid]
+    
+    # DEBUG: Report after SPT filter
+    try:
+        from loguru import logger as guru
+        guru.info(f"After SPT filter (spt_threshold={spt_threshold}): "
+                 f"{candidates_before_spt.numel()} → {candidates.numel()} candidates")
+        if candidates.numel() > 0:
+            cand_u = u_scalar[candidates]
+            mean_u_after_spt = cand_u.mean(dim=1)
+            guru.info(f"  Remaining mean_u: min={mean_u_after_spt.min():.2e}, median={mean_u_after_spt.median():.2e}, "
+                     f"max={mean_u_after_spt.max():.2e}")
+    except:
+        pass
 
     if candidates.numel() == 0:
         raise RuntimeError(
@@ -146,6 +180,17 @@ def build_graph(
         mean_u = u_scalar[candidates].mean(dim=1)
         top = mean_u.topk(max_key, largest=False).indices
         candidates = candidates[top]
+        
+        # DEBUG: Report key node uncertainty statistics AFTER selection
+        try:
+            from loguru import logger as guru
+            selected_u = u_scalar[candidates]  # (max_key, T)
+            mean_u_selected = selected_u.mean(dim=1)  # (max_key,) -- average over time
+            guru.info(f"Key node selection (after filtering): {candidates.numel()} selected | "
+                     f"mean_u stats: min={mean_u_selected.min():.2e}, mean={mean_u_selected.mean():.2e}, "
+                     f"max={mean_u_selected.max():.2e}")
+        except:
+            pass
 
     key_idx = candidates   # (N_k,)
 
